@@ -243,42 +243,39 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # ------------------------------------------------------------------
         # [新增修改 2/2] 计算 Target Entropy/Prob 并打印对比信息
         # ------------------------------------------------------------------
-        if self.draft_entropy is not None:
-            try:
-                target_logits = logits_output.next_token_logits
-                
-                # 1. 计算 Target 模型的分布统计 (Probability & Entropy)
-                target_probs = torch.softmax(target_logits, dim=-1)
-                # 加 1e-6 是为了防止 log(0)
-                target_log_probs = torch.log(target_probs + 1e-6)
-                target_entropy = -torch.sum(target_probs * target_log_probs, dim=-1)
-                
-                # 获取 Target 模型对当前位置预测概率最高的那个值的概率 (Top-1 Confidence)
-                target_top_prob, _ = torch.max(target_probs, dim=-1)
+        try:
+            # 1. 计算 Target 模型的分布统计
+            # target_logits shape: (total_num_tokens, vocab_size)
+            target_probs = torch.softmax(target_logits, dim=-1)
+            target_log_probs = torch.log(target_probs + 1e-6)
+            target_entropy = -torch.sum(target_probs * target_log_probs, dim=-1)
+            target_top_prob, _ = torch.max(target_probs, dim=-1)
 
-                # 2. 打印对比表格
-                # 我们只打印前 5 个 token 的信息，防止日志刷屏
-                print(f"\n[EAGLE STATS] Batch Size: {len(batch.reqs)}")
-                print(f"{'TokenID':<10} | {'Draft Ent':<10} | {'Target Ent':<10} | {'Draft Prob':<10} | {'Target Prob':<10}")
-                print("-" * 65)
-
-                limit = min(5, self.draft_entropy.numel())
+            # 2. 如果有 Draft 数据，则进行打印对比
+            if self.draft_entropy is not None:
+                print(f"\n[DEBUG] --- Speculative Decoding Statistics (Batch Size: {len(batch.reqs)}) ---")
                 
-                # 转换为 Python list 以便打印，flatten 确保维度对齐
-                d_ent = self.draft_entropy.flatten()[:limit].tolist()
-                t_ent = target_entropy.flatten()[:limit].tolist()
-                d_prob = self.draft_prob.flatten()[:limit].tolist()
-                t_prob = target_top_prob.flatten()[:limit].tolist()
-                d_ids = self.draft_token.flatten()[:limit].tolist()
-
-                for i in range(limit):
-                    print(f"{d_ids[i]:<10} | {d_ent[i]:<10.4f} | {t_ent[i]:<10.4f} | {d_prob[i]:<10.4f} | {t_prob[i]:<10.4f}")
-                print("-" * 65 + "\n")
+                # 为了不刷屏，只打印前几个 Token 的信息作为示例
+                # 注意：这里的数据通常是打平的 (flattened)，对应 Speculative Tree 的节点
+                num_to_print = min(5, self.draft_entropy.shape[0])
                 
-            except Exception as e:
-                # 捕获异常，确保打印逻辑不会导致整个推理流程崩溃
-                pass
-        # ------------------------------------------------------------------
+                d_ent = self.draft_entropy.cpu().tolist()
+                t_ent = target_entropy.cpu().tolist()
+                d_prob = self.draft_prob.cpu().tolist()
+                t_prob = target_top_prob.cpu().tolist()
+                
+                # 获取 Draft 预测的 Token ID 以便查看
+                d_ids = self.draft_token.flatten().cpu().tolist()
+
+                for i in range(num_to_print):
+                    print(f"  Token[{i}] ID: {d_ids[i]}")
+                    print(f"    Draft  -> Entropy: {d_ent[i]:.4f}, Prob: {d_prob[i]:.4f}")
+                    print(f"    Target -> Entropy: {t_ent[i]:.4f}, Prob: {t_prob[i]:.4f}")
+                    # 简单的启发式观察：如果 Entropy 差异大或 Prob 差异大，通常会被 Reject
+                
+                print("-" * 60)
+        except Exception as e:
+            pass # 防止打印逻辑报错影响主流程
         # ------------------------------------------------------------------
         
         
