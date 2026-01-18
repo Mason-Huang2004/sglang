@@ -537,18 +537,10 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        
-        # [修改] 强制关闭 CUDA Graph 以便拦截中间数据
-        # 调试完后若要恢复最高性能，需改回原来的检查逻辑
-        can_cuda_graph = False
-        # 原逻辑: can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch)
-
-        # 初始化变量
-        draft_entropy = None
-        draft_prob = None
-
+        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
+            forward_batch
+        )
         if can_cuda_graph:
-            # Graph 模式目前不支持拦截，会返回 None
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
             )
@@ -558,19 +550,12 @@ class EAGLEWorker(TpModelWorker):
                 not forward_batch.forward_mode.is_idle()
                 and self.speculative_num_steps > 1
             ):
+                # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-
-            # ======== [关键修改] ========
-            # 仅调用一次 draft_forward，并直接接收它计算好的 entropy 和 prob
-            # 这里去掉了之前多余的 forward 调用和 getattr，确保速度和正确性
-            (
-                parent_list,
-                top_scores_index,
-                draft_tokens,
-                draft_entropy,
-                draft_prob
-            ) = self.draft_forward(forward_batch)
-            # ==========================
+            # Run forward steps
+            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                forward_batch
+            )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -612,307 +597,9 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            
-            # [传入计算好的数据]
-            draft_entropy=draft_entropy,
-            draft_prob=draft_prob
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
-        # 1. 执行模型前向传播
-        logits_output = self.draft_model_runner.forward(forward_batch)
-
-        # ======== [新增] 计算 Entropy 和 Probability ========
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        log_probs = torch.log(probs + 1e-6)
-        
-        # 计算统计量
-        draft_entropy = -torch.sum(probs * log_probs, dim=-1)
-        draft_prob, _ = torch.max(probs, dim=-1)
-        # =================================================
-
-        # Parse args (保持原有逻辑)
-        spec_info = forward_batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
-        out_cache_loc = forward_batch.out_cache_loc
-        topk_p, topk_index, hidden_states = (
-            spec_info.topk_p,
-            spec_info.topk_index,
-            spec_info.hidden_states,
-        )
-        if self.hot_token_id is not None:
-            topk_index = self.hot_token_id[topk_index]
-        
-        out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
-        )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
-
-        # Return values
-        score_list: List[torch.Tensor] = []
-        token_list: List[torch.Tensor] = []
-        parents_list: List[torch.Tensor] = []
-
-        # Forward multiple steps
-        scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
-
-            if i == self.speculative_num_steps - 1:
-                break
-
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            
-            if (
-                self.server_args.speculative_algorithm == "STANDALONE"
-                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
-
-            # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
-
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
-
-        # ======== [修改] 返回 5 个值 ========
-        return parent_list, top_scores_index, draft_tokens, draft_entropy, draft_prob
-#     def draft(self, batch: ScheduleBatch):
-#         # Parse args
-#         if batch.forward_mode.is_idle():
-#             self._draft_preprocess_idle(batch)
-#         else:
-#             self._draft_preprocess_decode(batch)
-
-#         spec_info = batch.spec_info
-#         assert isinstance(spec_info, EagleDraftInput)
-
-#         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-#         spec_info.num_tokens_per_batch = self.topk
-#         spec_info.num_tokens_for_logprob_per_batch = self.topk
-#         batch.return_hidden_states = False
-
-#         # Get forward batch
-#         model_worker_batch = batch.get_model_worker_batch()
-#         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-#         forward_batch = ForwardBatch.init_new(
-#             model_worker_batch, self.draft_model_runner
-#         )
-#         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-#             forward_batch
-#         )
-#         # ======== [新增变量初始化] ========
-#         draft_entropy = None
-#         draft_prob = None
-#         # ================================
-#         if can_cuda_graph:
-#             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-#                 forward_batch
-#             )
-#         else:
-#             forward_batch.can_run_dp_cuda_graph = False
-#             if (
-#                 not forward_batch.forward_mode.is_idle()
-#                 and self.speculative_num_steps > 1
-#             ):
-#                 # Skip attention backend init for idle mode or 1-step draft
-#                 self.draft_attn_backend.init_forward_metadata(forward_batch)
-
-# # --- 方案：直接在这里展开 draft_forward 的部分逻辑以获取 logits ---
-#             # 1. 运行模型
-#             logits_output = self.draft_model_runner.forward(forward_batch)
-            
-#             # 2. [新增] 在这里计算 Entropy 和 Probability
-#             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-#             log_probs = torch.log(probs + 1e-6)
-#             draft_entropy = -torch.sum(probs * log_probs, dim=-1)
-#             draft_prob, _ = torch.max(probs, dim=-1)
-            
-#             # Run forward steps
-#             # parent_list, top_scores_index, draft_tokens = self.draft_forward(
-#             #     forward_batch
-#             # )
-#             # ======== [修改] 接收 5 个返回值 ========
-#             parent_list, top_scores_index, draft_tokens, draft_entropy, draft_prob = self.draft_forward(
-#                 forward_batch
-#             )
-#             # ======================================
-#             draft_entropy = getattr(self, "last_draft_entropy", None)
-#             draft_prob = getattr(self, "last_draft_prob", None)
-            
-#         if batch.forward_mode.is_idle():
-#             return EagleVerifyInput.create_idle_input(
-#                 self.topk,
-#                 self.speculative_num_steps,
-#                 self.speculative_num_draft_tokens,
-#             )
-
-#         (
-#             tree_mask,
-#             position,
-#             retrive_index,
-#             retrive_next_token,
-#             retrive_next_sibling,
-#             draft_tokens,
-#         ) = build_tree_kernel_efficient(
-#             spec_info.verified_id,
-#             parent_list,
-#             top_scores_index,
-#             draft_tokens,
-#             batch.seq_lens,
-#             batch.seq_lens_sum,
-#             self.topk,
-#             self.speculative_num_steps,
-#             self.speculative_num_draft_tokens,
-#         )
-
-#         return EagleVerifyInput(
-#             draft_token=draft_tokens,
-#             custom_mask=tree_mask,
-#             positions=position,
-#             retrive_index=retrive_index,
-#             retrive_next_token=retrive_next_token,
-#             retrive_next_sibling=retrive_next_sibling,
-#             retrive_cum_len=None,
-#             spec_steps=self.speculative_num_steps,
-#             topk=self.topk,
-#             draft_token_num=self.server_args.speculative_num_draft_tokens,
-#             capture_hidden_mode=CaptureHiddenMode.FULL,
-#             seq_lens_sum=forward_batch.seq_lens_sum,
-#             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            
-#             # [传入新字段]
-#             draft_entropy=draft_entropy,
-#             draft_prob=draft_prob
-#         )
-
-    # def draft_forward(self, forward_batch: ForwardBatch):
-    #     # 1. 执行模型前向传播
-    #     logits_output = self.draft_model_runner.forward(forward_batch)
-        
-    #     # ======== [新增修改] 计算 Entropy 和 Probability ========
-    #     # 注意：这里需要在 GPU 上计算
-    #     probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-    #     log_probs = torch.log(probs + 1e-6)
-        
-    #     # 计算 Entropy: -sum(p * log(p))
-    #     # shape: (batch_size * tree_size)
-    #     draft_entropy = -torch.sum(probs * log_probs, dim=-1)
-        
-    #     # 计算 Max Probability (Confidence)
-    #     draft_prob, _ = torch.max(probs, dim=-1)
-    #     # ======================================================
-    #     # Parse args
-    #     spec_info = forward_batch.spec_info
-    #     assert isinstance(spec_info, EagleDraftInput)
-    #     out_cache_loc = forward_batch.out_cache_loc
-    #     topk_p, topk_index, hidden_states = (
-    #         spec_info.topk_p,
-    #         spec_info.topk_index,
-    #         spec_info.hidden_states,
-    #     )
-    #     if self.hot_token_id is not None:
-    #         topk_index = self.hot_token_id[topk_index]
-    #     # TODO: We only need self.speculative_num_steps - 1 cache loc
-    #     out_cache_loc = out_cache_loc.reshape(
-    #         forward_batch.batch_size, self.topk, self.speculative_num_steps
-    #     )
-    #     out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-    #         self.speculative_num_steps, -1
-    #     )
-
-    #     # Return values
-    #     score_list: List[torch.Tensor] = []
-    #     token_list: List[torch.Tensor] = []
-    #     parents_list: List[torch.Tensor] = []
-
-    #     # Forward multiple steps
-    #     scores = None
-    #     for i in range(self.speculative_num_steps):
-    #         input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-    #             i, topk_p, topk_index, hidden_states, scores, self.topk
-    #         )
-    #         score_list.append(tree_info[0])
-    #         token_list.append(tree_info[1])
-    #         parents_list.append(tree_info[2])
-
-    #         # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-    #         if i == self.speculative_num_steps - 1:
-    #             break
-
-    #         # Set inputs
-    #         forward_batch.input_ids = input_ids
-    #         # This is a temporary fix for the case that the user is using standalone
-    #         # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
-    #         # rope kernel needs cache_loc to be contiguous.
-    #         if (
-    #             self.server_args.speculative_algorithm == "STANDALONE"
-    #             and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
-    #         ):
-    #             out_cache_loc = out_cache_loc.contiguous()
-    #         forward_batch.out_cache_loc = out_cache_loc[i]
-    #         forward_batch.positions.add_(1)
-    #         forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-    #         spec_info.hidden_states = hidden_states
-
-    #         # Run forward
-    #         logits_output = self.draft_model_runner.forward(
-    #             forward_batch, skip_attn_backend_init=True
-    #         ).logits_output
-    #         if self.server_args.enable_nan_detection:
-    #             detect_nan(logits_output)
-    #         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-    #         topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-    #         if self.hot_token_id is not None:
-    #             topk_index = self.hot_token_id[topk_index]
-    #         hidden_states = logits_output.hidden_states
-
-    #     parent_list, top_scores_index, draft_tokens = organize_draft_results(
-    #         score_list, token_list, parents_list, self.speculative_num_draft_tokens
-    #     )
-
-    #     # return parent_list, top_scores_index, draft_tokens
-    #     # [修改返回值] 增加 draft_entropy, draft_prob
-    #     return parent_list, top_scores_index, draft_tokens, draft_entropy, draft_prob
-    
-    def draft_forward(self, forward_batch: ForwardBatch):
-        # 1. Run model forward
-        logits_output = self.draft_model_runner.forward(forward_batch)
-
-        # ======== [新增] 计算 Draft 模型的 Entropy 和 Probability ========
-        # 我们只计算 Draft 模型第一步(Root)的统计信息，代表模型对当前状态的信心
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        log_probs = torch.log(probs + 1e-6)
-        
-        # 计算 Entropy: -sum(p * log(p))
-        draft_entropy = -torch.sum(probs * log_probs, dim=-1)
-        
-        # 计算 Max Probability (Confidence)
-        draft_prob, _ = torch.max(probs, dim=-1)
-        # ===============================================================
-
         # Parse args
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -982,10 +669,8 @@ class EAGLEWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-        # ======== [修改] 返回 5 个值 ========
-        return parent_list, top_scores_index, draft_tokens, draft_entropy, draft_prob
-    
-    
+        return parent_list, top_scores_index, draft_tokens
+
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
         pass
