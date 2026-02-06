@@ -199,6 +199,10 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+# ... 现有的 imports ...
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.debug_utils.logit_analysis import analyze_logits_and_dump
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -2893,6 +2897,98 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+
+            # ================= [修改 START: Target Stats Logging] =================
+            # 仅在 Target Verify 阶段，且为主卡时记录
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.tp_rank == 0
+                and not self.is_draft_worker
+            ):
+                try:
+                    import json
+                    import time
+
+                    # 获取 Logits
+                    logits_res = output.logits_output
+                    target_logits = None
+                    if hasattr(logits_res, "next_token_logits"):
+                        target_logits = logits_res.next_token_logits
+                    elif isinstance(logits_res, torch.Tensor):
+                        target_logits = logits_res
+
+                    if target_logits is not None:
+                        # 1. 计算统计量 (在 GPU 上计算以利用并行能力，然后转 CPU)
+                        probs = torch.softmax(target_logits, dim=-1)
+                        log_probs = torch.log(probs + 1e-6)
+                        entropy = -torch.sum(
+                            probs * log_probs, dim=-1
+                        )  # [Total_Tokens]
+                        max_prob, _ = torch.max(probs, dim=-1)  # [Total_Tokens]
+
+                        # 2. 获取 Batch 信息
+                        req_ids = forward_batch.req_pool_indices.tolist()
+                        batch_size = len(req_ids)
+
+                        # 3. 确定切片长度 (Chunk Size)
+                        # Eagle Verify 时，Target 对每个 Request 验证的 Token 数量是固定的
+                        # 通常等于 speculative_num_draft_tokens (或者 +1，取决于实现细节)
+                        # 这里我们根据 total_tokens / batch_size 动态计算
+                        total_tokens = target_logits.shape[0]
+                        if batch_size > 0:
+                            chunk_size = total_tokens // batch_size
+                        else:
+                            chunk_size = 0
+
+                        # 转为 List 准备写入
+                        ent_cpu = entropy.tolist()
+                        prob_cpu = max_prob.tolist()
+                        timestamp = time.time()
+                        # [关键修改] 不要写死 "offline_execution.log"
+                        # 改为从环境变量读取，如果没有变量则不写入
+                        log_path = os.environ.get("EAGLE_LOG_FILE")
+                        
+                        if log_path:
+                            # 确保目录存在 (防止多进程竞争报错，虽不完美但够用)
+                            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+                            
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                for b_idx, req_id in enumerate(req_ids):
+                                    start = b_idx * chunk_size
+                                    end = start + chunk_size
+                                    log_entry = {
+                                        "type": "target_stats",
+                                        "ts": ts,
+                                        "bid": req_id,
+                                        "ent_seq": ent_cpu[start:end],
+                                        "prob_seq": [0.0] * len(ent_cpu[start:end])
+                                    }
+                                    f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+                except Exception as e:
+                    pass # 忽略日志错误，不影响推理
+
+                #         # 4. 写入日志
+                #         with open("offline_execution.log", "a", encoding="utf-8") as f:
+                #             for b_idx, req_id in enumerate(req_ids):
+                #                 start = b_idx * chunk_size
+                #                 end = start + chunk_size
+
+                #                 # 提取该 Request 对应的序列
+                #                 ent_seq = ent_cpu[start:end]
+                #                 prob_seq = prob_cpu[start:end]
+
+                #                 log_entry = {
+                #                     "type": "target_stats",
+                #                     "ts": timestamp,
+                #                     "bid": req_id,
+                #                     "ent_seq": ent_seq,
+                #                     "prob_seq": prob_seq,
+                #                 }
+                #                 f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+                # except Exception as e:
+                #     # 避免日志代码崩溃影响主流程
+                #     pass
+            # ================= [修改 END] =================
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache

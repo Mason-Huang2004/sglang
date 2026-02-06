@@ -71,6 +71,9 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+# === [添加这行] ===
+from sglang.srt.debug_utils.logit_analysis import analyze_logits_and_dump
+
 _is_npu = is_npu()
 
 if is_cuda():
@@ -851,6 +854,21 @@ class MultiLayerEagleWorker(TpModelWorker):
         topk_index_list = []
         for step in range(self.speculative_num_steps):
             logits_output, _ = self.mtp_model_runner(step).forward(forward_batch)
+            # ==========================================================
+            # === [修改点 1] 插入 Draft Model (Extend阶段) 监控代码 ===
+            # ==========================================================
+            if logits_output is not None:
+                # 获取 logits (Eagle3 的 logits 通常是 [batch_size, vocab_size])
+                draft_logits = logits_output.next_token_logits
+
+                # 使用 req_pool_indices 作为 Batch ID，确保能与 Target Model 对齐
+                batch_ids = forward_batch.req_pool_indices
+
+                # 记录日志，注意传入 step 信息
+                analyze_logits_and_dump(
+                    draft_logits, batch_ids, model_type="draft", step_offset=step
+                )
+            # ==========================================================
             if self.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -958,6 +976,17 @@ class MultiLayerEagleWorker(TpModelWorker):
                 logits_output, _ = self.mtp_model_runner(step).forward(
                     forward_batch, skip_attn_backend_init=True
                 )
+            # ==========================================================
+            # === [修改点 2] 插入 Draft Model (Decode阶段) 监控代码 ===
+            # ==========================================================
+            if logits_output is not None:
+                draft_logits = logits_output.next_token_logits
+                batch_ids = forward_batch.req_pool_indices
+
+                analyze_logits_and_dump(
+                    draft_logits, batch_ids, model_type="draft", step_offset=step
+                )
+            # ==========================================================
 
             if self.enable_nan_detection:
                 detect_nan(logits_output)

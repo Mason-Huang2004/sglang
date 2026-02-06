@@ -70,13 +70,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     # Shape info for padding
     num_tokens_per_batch: int = -1
-    
-    # ------------------------------------------------------------------
-    # [新增修改 1/2] 添加字段用于存储 Draft 模型的 Entropy 和 Probability
-    # ------------------------------------------------------------------
-    draft_entropy: Optional[torch.Tensor] = None
-    draft_prob: Optional[torch.Tensor] = None
-    # ------------------------------------------------------------------
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -238,51 +231,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
         """
-        
-        
-        # ------------------------------------------------------------------
-        # [新增修改 2/2] 计算 Target Entropy/Prob 并打印对比信息
-        # ------------------------------------------------------------------
-        if self.draft_entropy is not None:
-            try:
-                target_logits = logits_output.next_token_logits
-                
-                # 1. 计算 Target 模型的分布统计 (Probability & Entropy)
-                target_probs = torch.softmax(target_logits, dim=-1)
-                # 加 1e-6 是为了防止 log(0)
-                target_log_probs = torch.log(target_probs + 1e-6)
-                target_entropy = -torch.sum(target_probs * target_log_probs, dim=-1)
-                
-                # 获取 Target 模型对当前位置预测概率最高的那个值的概率 (Top-1 Confidence)
-                target_top_prob, _ = torch.max(target_probs, dim=-1)
-
-                # 2. 打印对比表格
-                # 我们只打印前 5 个 token 的信息，防止日志刷屏
-                print(f"\n[EAGLE STATS] Batch Size: {len(batch.reqs)}")
-                print(f"{'TokenID':<10} | {'Draft Ent':<10} | {'Target Ent':<10} | {'Draft Prob':<10} | {'Target Prob':<10}")
-                print("-" * 65)
-
-                limit = min(5, self.draft_entropy.numel())
-                
-                # 转换为 Python list 以便打印，flatten 确保维度对齐
-                d_ent = self.draft_entropy.flatten()[:limit].tolist()
-                t_ent = target_entropy.flatten()[:limit].tolist()
-                d_prob = self.draft_prob.flatten()[:limit].tolist()
-                t_prob = target_top_prob.flatten()[:limit].tolist()
-                d_ids = self.draft_token.flatten()[:limit].tolist()
-
-                for i in range(limit):
-                    print(f"{d_ids[i]:<10} | {d_ent[i]:<10.4f} | {t_ent[i]:<10.4f} | {d_prob[i]:<10.4f} | {t_prob[i]:<10.4f}")
-                print("-" * 65 + "\n")
-                
-            except Exception as e:
-                # 捕获异常，确保打印逻辑不会导致整个推理流程崩溃
-                pass
-        # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-        
-        
-        
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(

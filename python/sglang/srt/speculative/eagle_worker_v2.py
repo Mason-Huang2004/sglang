@@ -2,6 +2,8 @@ import contextlib
 import logging
 import time
 from typing import List, Optional, Tuple
+import os
+import json
 
 import torch
 
@@ -379,7 +381,6 @@ class EagleDraftWorker(BaseDraftWorker):
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
             if i == self.speculative_num_steps - 1:
                 break
 
@@ -394,6 +395,41 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
+
+            # ================= [INSERTED LOGGING: Draft Stats (Loop)] =================
+            if self.tp_rank == 0:
+                try:
+                    log_file = os.environ.get("EAGLE_LOG_FILE")
+                    if log_file:
+                        # Ensure directory exists
+                        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                        
+                        _p_draft = torch.softmax(logits_output.next_token_logits, dim=-1)
+                        _h_draft = -torch.sum(_p_draft * torch.log(_p_draft + 1e-6), dim=-1)
+                        _max_p_draft, _ids_draft = torch.max(_p_draft, dim=-1)
+
+                        _req_ids = forward_batch.req_pool_indices.tolist()
+                        _ent_l = _h_draft.tolist()
+                        _prob_l = _max_p_draft.tolist()
+                        _token_l = _ids_draft.tolist()
+                        _ts = time.time()
+
+                        with open(log_file, "a", encoding="utf-8") as f:
+                            for b_idx, req_id in enumerate(_req_ids):
+                                log_entry = {
+                                    "type": "draft_stats",
+                                    "ts": _ts,
+                                    "bid": req_id,
+                                    "step": i + 1,
+                                    "ent": _ent_l[b_idx],
+                                    "prob": _prob_l[b_idx],
+                                    "token_id": _token_l[b_idx],
+                                }
+                                f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+                except Exception:
+                    pass
+            # ==========================================================================
+
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -403,14 +439,15 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states = logits_output.hidden_states
 
         # Organize the results
-        score_list = torch.cat(score_list, dim=1).flatten(
-            1
-        )  # b, n, topk; n= 1 + (num_steps-1) * self.topk
+        score_list = torch.cat(score_list, dim=1).flatten(1)
         ss_token_list = torch.cat(
             token_list, dim=1
         )  # b, (self.topk + (num_steps-1) * self.topk)
+        
         top_scores = torch.topk(
-            score_list, self.speculative_num_draft_tokens - 1, dim=-1
+            score_list,
+            self.speculative_num_draft_tokens - 1,
+            dim=-1,
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
@@ -466,6 +503,40 @@ class EagleDraftWorker(BaseDraftWorker):
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         logits_output = self.draft_runner.forward(forward_batch).logits_output
+
+        # ================= [INSERTED LOGGING: Draft Stats (Step 0 Prefill)] =================
+        if self.tp_rank == 0:
+            try:
+                log_file = os.environ.get("EAGLE_LOG_FILE")
+                if log_file:
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                    
+                    probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                    log_probs = torch.log(probs + 1e-6)
+                    entropy = -torch.sum(probs * log_probs, dim=-1)
+                    max_prob, top_ids = torch.max(probs, dim=-1)
+
+                    req_ids = batch.req_pool_indices.tolist()
+                    ent_list = entropy.tolist()
+                    prob_list = max_prob.tolist()
+                    token_list = top_ids.tolist()
+                    ts = time.time()
+
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        for b_idx, req_id in enumerate(req_ids):
+                            log_entry = {
+                                "type": "draft_stats",
+                                "ts": ts,
+                                "bid": req_id,
+                                "step": 0,
+                                "ent": ent_list[b_idx],
+                                "prob": prob_list[b_idx],
+                                "token_id": token_list[b_idx],
+                            }
+                            f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+            except Exception:
+                pass
+        # ==================================================================================
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -524,6 +595,41 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]
+
+        # ================= [INSERTED LOGGING: Draft Stats (Step 0 Decode)] =================
+        if self.tp_rank == 0:
+            try:
+                log_file = os.environ.get("EAGLE_LOG_FILE")
+                if log_file:
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                    
+                    probs = torch.softmax(draft_logits_output.next_token_logits, dim=-1)
+                    log_probs = torch.log(probs + 1e-6)
+                    entropy = -torch.sum(probs * log_probs, dim=-1)
+                    max_prob, top_ids = torch.max(probs, dim=-1)
+
+                    req_ids = batch.req_pool_indices.tolist()
+                    ent_list = entropy.tolist()
+                    prob_list = max_prob.tolist()
+                    token_list = top_ids.tolist()
+                    ts = time.time()
+
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        for b_idx, req_id in enumerate(req_ids):
+                            log_entry = {
+                                "type": "draft_stats",
+                                "ts": ts,
+                                "bid": req_id,
+                                "step": 0,
+                                "ent": ent_list[b_idx],
+                                "prob": prob_list[b_idx],
+                                "token_id": token_list[b_idx],
+                            }
+                            f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+            except Exception:
+                pass
+        # =================================================================================
+
         draft_logits_output.hidden_states = draft_logits_output.hidden_states[
             select_index
         ]
@@ -732,6 +838,36 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_length,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
+
+         # ================= [INSERTED LOGGING: Verify Results with Token IDs] =================
+        if self.tp_rank == 0:
+            try:
+                log_file = os.environ.get("EAGLE_LOG_FILE")
+                if log_file:
+                    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                    
+                    # 使用新接口提取 accepted tokens
+                    accepted_tokens_list = verify_input.get_accepted_tokens_list(
+                        predict, accept_index, accept_length, batch
+                    )
+                    
+                    acc_lens = accept_length.tolist()
+                    req_ids = batch.req_pool_indices.tolist()
+                    ts = time.time()
+
+                    with open(log_file, "a", encoding="utf-8") as f:
+                        for b_idx, req_id in enumerate(req_ids):
+                            log_entry = {
+                                "type": "verify_result",
+                                "ts": ts,
+                                "bid": req_id,
+                                "acc_len": acc_lens[b_idx],
+                                "accepted_token_ids": accepted_tokens_list[b_idx],  # 新增字段
+                            }
+                            f.write(f"DATA_LOG:{json.dumps(log_entry)}\n")
+            except Exception:
+                pass
+        # ====================================================================================
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()

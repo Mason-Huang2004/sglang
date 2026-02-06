@@ -376,6 +376,116 @@ class EagleVerifyInputV2Mixin:
         accept_length.add_(1)
         return predict, accept_length, accept_index
 
+    # ==================== [NEW METHODS FOR TOKEN EXTRACTION] ====================
+    def extract_accepted_tokens(
+        self: EagleVerifyInput,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        batch: ModelWorkerBatch,
+    ) -> torch.Tensor:
+        """
+        提取每个请求被接受的具体 token IDs
+        
+        Args:
+            predict: Target model 采样的所有 tokens [Total_Tokens]
+            accept_index: 接受路径的索引 [bs, spec_steps+1]
+            accept_length: 每个请求接受的长度 [bs]
+            batch: ModelWorkerBatch
+            
+        Returns:
+            accepted_tokens: [bs, Max_Accept_Length] 被接受的 token IDs
+                            未使用的位置填充 -1
+        """
+        if batch.forward_mode.is_idle():
+            return torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
+        
+        bs = len(batch.seq_lens)
+        device = batch.input_ids.device
+        
+        # 获取最大接受长度(包含 bonus token)
+        max_accept_len = accept_length.max().item()
+        
+        # 初始化结果张量,用 -1 填充
+        accepted_tokens = torch.full(
+            (bs, max_accept_len),
+            fill_value=-1,
+            dtype=torch.long,
+            device=device
+        )
+        
+        # 使用树结构回溯提取tokens
+        self._extract_via_tree_traversal(
+            accepted_tokens,
+            predict,
+            accept_index,
+            accept_length,
+            bs,
+        )
+        
+        return accepted_tokens
+    
+    def _extract_via_tree_traversal(
+        self: EagleVerifyInput,
+        accepted_tokens: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        bs: int,
+    ):
+        """通过树结构回溯提取 tokens"""
+        candidates = self.draft_token.reshape(bs, self.draft_token_num)
+        predict_reshaped = predict.reshape(bs, self.draft_token_num)
+        
+        for b in range(bs):
+            acc_len = accept_length[b].item()
+            if acc_len <= 0:
+                continue
+            
+            # 提取 draft tokens (前 acc_len-1 个)
+            for step in range(acc_len - 1):
+                idx = accept_index[b, step].item()
+                if idx >= 0 and idx < self.draft_token_num:
+                    accepted_tokens[b, step] = candidates[b, idx]
+            
+            # 最后一个是 bonus token (从 predict 中获取)
+            if acc_len > 0:
+                # bonus token 位于路径最后一个节点
+                last_idx = accept_index[b, acc_len - 2].item() if acc_len > 1 else 0
+                if last_idx >= 0 and last_idx < self.draft_token_num:
+                    accepted_tokens[b, acc_len - 1] = predict_reshaped[b, last_idx]
+    
+    def get_accepted_tokens_list(
+        self: EagleVerifyInput,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+        batch: ModelWorkerBatch,
+    ) -> list:
+        """
+        获取被接受的 token IDs 列表(更易用的接口)
+        
+        Returns:
+            List[List[int]]: 每个请求的 accepted token 列表
+        """
+        accepted_tokens = self.extract_accepted_tokens(
+            predict, accept_index, accept_length, batch
+        )
+        
+        if accepted_tokens.numel() == 0:
+            return []
+        
+        result = []
+        for b in range(accepted_tokens.shape[0]):
+            acc_len = accept_length[b].item()
+            tokens = accepted_tokens[b, :acc_len].cpu().tolist()
+            # 过滤掉 -1 (padding)
+            tokens = [t for t in tokens if t != -1]
+            result.append(tokens)
+        
+        return result
+    # ============================================================================
+
 
 @triton.jit
 def fill_new_verified_id(
