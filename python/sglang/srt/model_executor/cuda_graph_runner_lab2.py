@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import contextmanager
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Optional, Union, List
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -221,20 +221,22 @@ def set_global_graph_memory_pool(val):
 
 
 class GreenContextManager:
-    """Manages CUDA Green Contexts for SM partitioning with custom fractions."""
+    """Manages CUDA Green Contexts for SM partitioning."""
 
-    def __init__(
-        self, device_id: int, num_partitions: int = 2, sm_fractions: List[float] = None
-    ):
+    def __init__(self, device_id: int, num_partitions: int = 2):
         if not GREEN_CONTEXT_AVAILABLE:
-            raise RuntimeError("Green Context requires cuda-python package (>= 12.4).")
+            raise RuntimeError(
+                "Green Context requires cuda-python package (>= 12.4). "
+                "Install with: pip install cuda-python"
+            )
         self.device_id = device_id
         self.num_partitions = num_partitions
-        self.sm_fractions = sm_fractions
         self.green_ctxs = []
         self.cuda_ctxs = []
         self.driver_streams = []
         self.torch_streams = []
+        self.total_sms = 0
+        self.sms_per_partition = 0
         self._initialized = False
         self._setup()
 
@@ -257,6 +259,7 @@ class GreenContextManager:
         drv = cuda_drv
         self._check(drv.cuInit(0))
         device = self._check(drv.cuDeviceGet(self.device_id))
+        self._device = device
 
         sm_count = self._check(
             drv.cuDeviceGetAttribute(
@@ -264,25 +267,20 @@ class GreenContextManager:
                 device,
             )
         )
-        alignment = 2
-        total_chunks = sm_count // alignment
+        self.total_sms = sm_count
 
-        # Compute SM allocation chunks based on ratios
-        if self.sm_fractions is None:
-            chunks_per_part = total_chunks // self.num_partitions
-            chunk_allocs = [chunks_per_part] * self.num_partitions
-        else:
-            assert len(self.sm_fractions) == self.num_partitions
-            chunk_allocs = []
-            rem = total_chunks
-            for f in self.sm_fractions[:-1]:
-                c = max(1, int(total_chunks * f))  # 至少分配一个 Block (2个SM) 防止死锁
-                chunk_allocs.append(c)
-                rem -= c
-            chunk_allocs.append(max(1, rem))
+        alignment = 2
+        raw_sms_per_partition = sm_count // self.num_partitions
+        self.sms_per_partition = (raw_sms_per_partition // alignment) * alignment
+
+        if self.sms_per_partition < alignment:
+            raise RuntimeError(
+                f"Not enough SMs ({sm_count}) for {self.num_partitions} partitions after alignment"
+            )
 
         logger.info(
-            f"GreenContext: total_sms={sm_count}, splitting into {chunk_allocs} chunks (2 SMs/chunk)."
+            f"GreenContext: device={self.device_id}, total_sms={self.total_sms}, "
+            f"partitions={self.num_partitions}, sms_per_partition={self.sms_per_partition} (Aligned)"
         )
 
         dev_resource = self._check(
@@ -291,29 +289,35 @@ class GreenContextManager:
             )
         )
 
-        # 核心劈分：切成最小粒度的碎片
         split_result = self._check(
-            drv.cuDevSmResourceSplitByCount(total_chunks, dev_resource, 0, alignment)
+            drv.cuDevSmResourceSplitByCount(
+                self.num_partitions, dev_resource, 0, self.sms_per_partition
+            )
         )
-        split_resources, nb_groups, _ = split_result
-        if not isinstance(split_resources, (list, tuple)):
-            split_resources = [split_resources]
+        split_resources, nb_groups, _remainder = split_result
 
-        # 按定制比例重新拼装
-        start_idx = 0
-        actual_partitions = 0
-        for i in range(self.num_partitions):
-            num_chunks = chunk_allocs[i]
-            if num_chunks <= 0:
-                continue
+        actual_partitions = min(
+            nb_groups if isinstance(nb_groups, int) else int(nb_groups),
+            self.num_partitions,
+        )
 
-            res_list = list(split_resources[start_idx : start_idx + num_chunks])
-            start_idx += num_chunks
+        if actual_partitions < self.num_partitions:
+            raise RuntimeError(
+                f"Hardware only allowed {actual_partitions} partitions, requested {self.num_partitions}."
+            )
 
-            desc = self._check(drv.cuDevResourceGenerateDesc(res_list, len(res_list)))
+        for i in range(actual_partitions):
+            resource = (
+                split_resources[i]
+                if isinstance(split_resources, (list, tuple))
+                else split_resources
+            )
+            desc = self._check(drv.cuDevResourceGenerateDesc([resource], 1))
             green_ctx = self._check(
                 drv.cuGreenCtxCreate(
-                    desc, device, drv.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM
+                    desc,
+                    device,
+                    drv.CUgreenCtxCreate_flags.CU_GREEN_CTX_DEFAULT_STREAM,
                 )
             )
             self.green_ctxs.append(green_ctx)
@@ -322,13 +326,17 @@ class GreenContextManager:
             stream = self._check(drv.cuGreenCtxStreamCreate(green_ctx, 1, 0))
             self.driver_streams.append(stream)
             torch_stream = torch.cuda.ExternalStream(
-                stream_ptr=int(stream), device=torch.device(f"cuda:{self.device_id}")
+                stream_ptr=int(stream),
+                device=torch.device(f"cuda:{self.device_id}"),
             )
             self.torch_streams.append(torch_stream)
-            actual_partitions += 1
 
         self.num_partitions = actual_partitions
         self._initialized = True
+        logger.info(
+            f"GreenContext: successfully created {actual_partitions} partitions "
+            f"({self.sms_per_partition} SMs each)"
+        )
 
     @contextmanager
     def use_partition(self, partition_idx: int):
@@ -348,6 +356,9 @@ class GreenContextManager:
         for stream in self.torch_streams:
             stream.synchronize()
 
+    def synchronize_partition(self, partition_idx: int):
+        self.torch_streams[partition_idx].synchronize()
+
     def destroy(self):
         if not self._initialized:
             return
@@ -355,18 +366,19 @@ class GreenContextManager:
         for stream in self.driver_streams:
             try:
                 drv.cuStreamDestroy(stream)
-            except:
+            except Exception:
                 pass
         for green_ctx in self.green_ctxs:
             try:
                 drv.cuGreenCtxDestroy(green_ctx)
-            except:
+            except Exception:
                 pass
         self.green_ctxs.clear()
         self.cuda_ctxs.clear()
         self.driver_streams.clear()
         self.torch_streams.clear()
         self._initialized = False
+        logger.info("GreenContext: destroyed all partitions")
 
     def __del__(self):
         self.destroy()
@@ -403,27 +415,31 @@ class CudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
 
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
-
         if (
-            self.model_runner.spec_algorithm.is_eagle()
-            or self.model_runner.spec_algorithm.is_standalone()
-            or self.model_runner.spec_algorithm.is_ngram()
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_ngram()
         ):
-            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
-            )
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen")
+            else:
+                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+                self.num_tokens_per_bs = (
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -447,6 +463,7 @@ class CudaGraphRunner:
 
         if self.enable_torch_compile:
             set_torch_compile_config()
+
         if self.model_runner.server_args.enable_lora:
             self.model_runner.lora_manager.init_cuda_graph_batch_info(
                 max_bs_in_cuda_graph=self.max_bs,
@@ -458,6 +475,8 @@ class CudaGraphRunner:
             and self.model_runner.spec_algorithm.is_none()
         )
 
+        if self.require_gathered_buffer:
+            assert self.require_mlp_tp_gather or self.require_attn_tp_gather
         self.buffers: GraphInputBuffers = GraphInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
@@ -478,13 +497,9 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Green Context Variables
+        # Green Context support
         self.green_ctx_manager: Optional[GreenContextManager] = None
         self.green_ctx_buffers: dict = {}
-        self.green_ctx_graphs: dict = {}
-        self.green_ctx_output_buffers: dict = {}
-        self.green_ctx_attn_backends: dict = {}
-        self.green_ctx_ndts: list = []
         self._green_ctx_partition_bs: list = []
 
         if model_runner.spec_algorithm.is_eagle3():
@@ -494,7 +509,9 @@ class CudaGraphRunner:
             with model_capture_mode():
                 self.capture()
         except RuntimeError as e:
-            raise Exception(f"Capture cuda graph failed: {e}")
+            raise Exception(
+                f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
+            )
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -506,32 +523,34 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
-        cuda_graph_bs = (
-            (
+        if self.require_mlp_tp_gather:
+            cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 else max(forward_batch.global_num_tokens_cpu)
             )
-            if self.require_mlp_tp_gather
-            else forward_batch.batch_size
-        )
-        graph_key = (
-            f"{get_current_stream_idx()}_{cuda_graph_bs}"
-            if self.enable_pdmux
-            else cuda_graph_bs
-        )
+        else:
+            cuda_graph_bs = forward_batch.batch_size
+
+        graph_key = cuda_graph_bs
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+
         is_bs_supported = (
             graph_key in self.graphs
             if self.disable_padding
             else cuda_graph_bs <= self.max_bs
         )
+
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
+
         is_encoder_lens_supported = (
             torch.all(forward_batch.encoder_lens > 0)
             if self.is_encoder_decoder
             else True
         )
+
         requested_capture_hidden_mode = max(
             forward_batch.capture_hidden_mode,
             (
@@ -548,6 +567,7 @@ class CudaGraphRunner:
         is_tbo_supported = (
             forward_batch.can_run_tbo if self.enable_two_batch_overlap else True
         )
+
         is_ngram_supported = (
             (
                 forward_batch.batch_size * self.num_tokens_per_bs
@@ -556,6 +576,7 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -564,23 +585,64 @@ class CudaGraphRunner:
             and is_ngram_supported
         )
 
+    def _init_profile_context_and_memory_record(self):
+        profile_context = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
+        torch.cuda.memory._record_memory_history()
+        return profile_context
+
+    def _post_process_after_profile(self, prof_context):
+        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        log_message = (
+            "Sorted by CUDA Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="cuda_time_total", row_limit=10
+            )
+            + "\n\nSorted by CPU Time:\n"
+            + prof_context.key_averages(group_by_input_shape=True).table(
+                sort_by="cpu_time_total", row_limit=10
+            )
+            + "\n\nMemory Usage is saved to cuda_graph_runner_memory_usage.pickle\n"
+        )
+        logger.info(log_message)
+
     def capture(self) -> None:
         profile_context = empty_context()
+        if self.enable_profile_cuda_graph:
+            profile_context = self._init_profile_context_and_memory_record()
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
+            avail_mem = get_available_gpu_memory(
+                self.model_runner.device,
+                self.model_runner.gpu_id,
+                empty_cache=False,
+            )
             capture_range = (
                 tqdm.tqdm(list(reversed(self.capture_bs)))
                 if get_tensor_model_parallel_rank() == 0
                 else reversed(self.capture_bs)
             )
             for i, bs in enumerate(capture_range):
+                if get_tensor_model_parallel_rank() == 0:
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    capture_range.set_description(
+                        f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    )
+
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    graph, output_buffers = self.capture_one_batch_size(
+                    (graph, output_buffers) = self.capture_one_batch_size(
                         bs, forward, stream_idx
                     )
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
@@ -600,6 +662,9 @@ class CudaGraphRunner:
                     ) as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
+
+        if self.enable_profile_cuda_graph:
+            self._post_process_after_profile(prof)
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -636,18 +701,18 @@ class CudaGraphRunner:
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
-        encoder_lens = buffers.encoder_lens[:bs] if self.is_encoder_decoder else None
+        if self.is_encoder_decoder:
+            encoder_lens = buffers.encoder_lens[:bs]
+        else:
+            encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         buffers.num_token_non_padded[...] = num_tokens
 
-        pp_proxy_tensors = (
-            PPProxyTensors(
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
-            if self.pp_size > 1
-            else None
-        )
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
@@ -682,7 +747,11 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
-        lora_ids = [None] * bs if self.model_runner.server_args.enable_lora else None
+        if self.model_runner.server_args.enable_lora:
+            lora_ids = [None] * bs
+        else:
+            lora_ids = None
+
         mamba_track_indices = (
             buffers.mamba_track_indices[:bs]
             if buffers.mamba_track_indices is not None
@@ -694,11 +763,13 @@ class CudaGraphRunner:
             else None
         )
 
+        # [核心修改 1]：允许接收独立的 custom_attn_backend
         if custom_attn_backend is not None:
             attn_backend = custom_attn_backend
         elif stream_idx is None:
             attn_backend = self.model_runner.attn_backend
         else:
+            assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
         forward_batch = ForwardBatch(
@@ -734,6 +805,7 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
@@ -755,6 +827,7 @@ class CudaGraphRunner:
                 forward_batch.dp_padding_mode.is_max_len(),
             )
             set_is_extend_in_batch(False)
+
             kwargs = {}
             if (
                 self.pp_size > 1
@@ -763,9 +836,11 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+
             return forward(input_ids, forward_batch.positions, forward_batch, **kwargs)
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
+
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
@@ -847,12 +922,11 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-
-        attn_backend = (
-            self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
-            if self.enable_pdmux
-            else self.model_runner.attn_backend
-        )
+        if self.enable_pdmux:
+            stream_idx = get_current_stream_idx()
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+        else:
+            attn_backend = self.model_runner.attn_backend
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -863,6 +937,7 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
+
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
@@ -874,29 +949,27 @@ class CudaGraphRunner:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         self.deepep_adapter.replay()
+
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        graph_key = (
-            f"{get_current_stream_idx()}_{self.bs}" if self.enable_pdmux else self.bs
-        )
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{self.bs}"
+        else:
+            graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
-                next_token_logits, full_logits = (
-                    None,
-                    output.full_logits[: self.raw_num_token],
-                )
+                next_token_logits = None
+                full_logits = output.full_logits[: self.raw_num_token]
             else:
-                full_logits, next_token_logits = (
-                    None,
-                    output.next_token_logits[: self.raw_num_token],
-                )
+                full_logits = None
+                next_token_logits = output.next_token_logits[: self.raw_num_token]
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
@@ -907,6 +980,7 @@ class CudaGraphRunner:
                 ),
             )
         else:
+            assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
     def get_spec_info(self, num_tokens: int):
@@ -917,21 +991,24 @@ class CudaGraphRunner:
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-            spec_info = EagleVerifyInput(
-                draft_token=None,
-                custom_mask=self.buffers.custom_mask,
-                positions=None,
-                retrive_index=None,
-                retrive_next_token=None,
-                retrive_next_sibling=None,
-                retrive_cum_len=None,
-                spec_steps=self.model_runner.server_args.speculative_num_steps,
-                topk=self.model_runner.server_args.speculative_eagle_topk,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                capture_hidden_mode=CaptureHiddenMode.FULL,
-                seq_lens_sum=None,
-                seq_lens_cpu=None,
-            )
+            if self.model_runner.is_draft_worker:
+                raise RuntimeError("This should not happen.")
+            else:
+                spec_info = EagleVerifyInput(
+                    draft_token=None,
+                    custom_mask=self.buffers.custom_mask,
+                    positions=None,
+                    retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
+                    retrive_cum_len=None,
+                    spec_steps=self.model_runner.server_args.speculative_num_steps,
+                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    capture_hidden_mode=CaptureHiddenMode.FULL,
+                    seq_lens_sum=None,
+                    seq_lens_cpu=None,
+                )
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
@@ -948,131 +1025,22 @@ class CudaGraphRunner:
         return spec_info
 
     # ══════════════════════════════════════════════════════════════════
-    #  Green Context Methods (完美异构并发版)
+    #  Green Context Methods (修改版)
+    #  - 不在分区内捕获 graph，复用主 context 的 self.graphs
+    #  - 通过 green context stream 实现 SM 分区
+    #  - 修复: init_forward_metadata_replay_cuda_graph 补上 seq_lens_cpu
     # ══════════════════════════════════════════════════════════════════
 
-    # def init_green_context(
-    #     self,
-    #     num_partitions: int = 2,
-    #     sm_fractions: List[float] = None,
-    #     custom_ndts: List[int] = None,
-    # ):
-    #     """初始化异构 Green Context SM 分区"""
-    #     self.green_ctx_manager = GreenContextManager(
-    #         device_id=self.model_runner.gpu_id,
-    #         num_partitions=num_partitions,
-    #         sm_fractions=sm_fractions,
-    #     )
-
-    #     partition_max_bs = self.max_bs // num_partitions
-    #     enable_mamba_track = (
-    #         self.model_runner.server_args.enable_mamba_extra_buffer()
-    #         and self.model_runner.spec_algorithm.is_none()
-    #     )
-
-    #     self.green_ctx_graphs = {}
-    #     self.green_ctx_output_buffers = {}
-    #     self.green_ctx_attn_backends = {}
-    #     self.green_ctx_ndts = (
-    #         custom_ndts if custom_ndts else [self.num_tokens_per_bs] * num_partitions
-    #     )
-
-    #     for part_idx in range(num_partitions):
-    #         part_ndt = self.green_ctx_ndts[part_idx]
-    #         partition_max_num_token = partition_max_bs * part_ndt
-
-    #         part_buffers = GraphInputBuffers.create(
-    #             device=self.device,
-    #             max_bs=partition_max_bs,
-    #             max_num_token=partition_max_num_token,
-    #             hidden_size=self.model_runner.model_config.hidden_size,
-    #             vocab_size=self.model_runner.model_config.vocab_size,
-    #             dtype=self.model_runner.model_config.dtype,
-    #             dp_size=self.dp_size,
-    #             pp_size=self.pp_size,
-    #             is_encoder_decoder=self.is_encoder_decoder,
-    #             require_mlp_tp_gather=self.require_mlp_tp_gather,
-    #             seq_len_fill_value=self.seq_len_fill_value,
-    #             encoder_len_fill_value=self.encoder_len_fill_value,
-    #             num_tokens_per_bs=part_ndt,
-    #             cache_loc_dtype=self._cache_loc_dtype(),
-    #             enable_mamba_track=enable_mamba_track,
-    #         )
-    #         self.green_ctx_buffers[part_idx] = part_buffers
-    #         self.green_ctx_graphs[part_idx] = {}
-    #         self.green_ctx_output_buffers[part_idx] = {}
-
-    #         part_backend = type(self.model_runner.attn_backend)(self.model_runner)
-    #         # [核心修复]: 继承并注入投机解码的验证步数，确保 FlashInfer 分配足够的指针数组
-    #         if hasattr(self.model_runner.attn_backend, "num_draft_tokens"):
-    #             part_backend.num_draft_tokens = part_ndt
-    #         part_backend.init_cuda_graph_state(
-    #             partition_max_bs, partition_max_num_token
-    #         )
-    #         self.green_ctx_attn_backends[part_idx] = part_backend
-
-    #     self._green_ctx_partition_bs = [
-    #         bs for bs in self.capture_bs if bs <= partition_max_bs
-    #     ]
-    #     if not self._green_ctx_partition_bs:
-    #         self._green_ctx_partition_bs = [partition_max_bs]
-
-    #     logger.info(
-    #         f"GreenContext: Capturing Independent Heterogeneous Graphs (NDTs: {self.green_ctx_ndts})"
-    #     )
-
-    #     orig_buffers = self.buffers
-    #     orig_stream = getattr(self, "stream", None)
-
-    #     try:
-    #         with model_capture_mode(), freeze_gc(
-    #             self.model_runner.server_args.enable_cudagraph_gc
-    #         ):
-    #             for part_idx in range(num_partitions):
-    #                 self.buffers = self.green_ctx_buffers[part_idx]
-    #                 part_backend = self.green_ctx_attn_backends[part_idx]
-    #                 part_ndt = self.green_ctx_ndts[part_idx]
-
-    #                 orig_ndt = self.num_tokens_per_bs
-    #                 self.num_tokens_per_bs = part_ndt
-
-    #                 with self.green_ctx_manager.use_partition(part_idx) as gc_stream:
-    #                     self.stream = gc_stream
-    #                     for bs in self._green_ctx_partition_bs:
-    #                         with patch_model(
-    #                             self.model_runner.model,
-    #                             bs in self.compile_bs,
-    #                             num_tokens=bs * part_ndt,
-    #                             tp_group=self.model_runner.tp_group,
-    #                         ) as forward:
-    #                             graph, out_bufs = self.capture_one_batch_size(
-    #                                 bs,
-    #                                 forward,
-    #                                 stream_idx=None,
-    #                                 custom_attn_backend=part_backend,
-    #                             )
-    #                             self.green_ctx_graphs[part_idx][bs] = graph
-    #                             self.green_ctx_output_buffers[part_idx][bs] = out_bufs
-    #                 self.num_tokens_per_bs = orig_ndt
-    #     finally:
-    #         self.buffers = orig_buffers
-    #         if orig_stream is not None:
-    #             self.stream = orig_stream
-
-    def init_green_context(
-        self,
-        num_partitions: int = 2,
-        sm_fractions: List[float] = None,
-        custom_ndts: List[int] = None,
-    ):
-        """初始化异构 Green Context SM 分区 (已修复 FlashInfer 指针溢出问题)"""
+    def init_green_context(self, num_partitions: int = 2):
+        """初始化 Green Context SM 分区，创建 stream + buffer，并为每个分区独立录制 Graph。"""
         self.green_ctx_manager = GreenContextManager(
             device_id=self.model_runner.gpu_id,
             num_partitions=num_partitions,
-            sm_fractions=sm_fractions,
         )
 
         partition_max_bs = self.max_bs // num_partitions
+        partition_max_num_token = partition_max_bs * self.num_tokens_per_bs
+
         enable_mamba_track = (
             self.model_runner.server_args.enable_mamba_extra_buffer()
             and self.model_runner.spec_algorithm.is_none()
@@ -1080,19 +1048,10 @@ class CudaGraphRunner:
 
         self.green_ctx_graphs = {}
         self.green_ctx_output_buffers = {}
+        # [核心修改 2]：新增独立的 Attention Backend 字典
         self.green_ctx_attn_backends = {}
-        self.green_ctx_buffers = {}  # 确保字典初始化
-        self.green_ctx_ndts = (
-            custom_ndts if custom_ndts else [self.num_tokens_per_bs] * num_partitions
-        )
-
-        # 🌟 关键修复点 1: 找出本次异构任务中最大的 ndt (比如 32)
-        max_ndt_needed = max(self.green_ctx_ndts)
 
         for part_idx in range(num_partitions):
-            part_ndt = self.green_ctx_ndts[part_idx]
-            partition_max_num_token = partition_max_bs * part_ndt
-
             part_buffers = GraphInputBuffers.create(
                 device=self.device,
                 max_bs=partition_max_bs,
@@ -1106,7 +1065,7 @@ class CudaGraphRunner:
                 require_mlp_tp_gather=self.require_mlp_tp_gather,
                 seq_len_fill_value=self.seq_len_fill_value,
                 encoder_len_fill_value=self.encoder_len_fill_value,
-                num_tokens_per_bs=part_ndt,
+                num_tokens_per_bs=self.num_tokens_per_bs,
                 cache_loc_dtype=self._cache_loc_dtype(),
                 enable_mamba_track=enable_mamba_track,
             )
@@ -1114,23 +1073,8 @@ class CudaGraphRunner:
             self.green_ctx_graphs[part_idx] = {}
             self.green_ctx_output_buffers[part_idx] = {}
 
-            # 🌟 关键修复点 2: 在实例化之前，临时改掉全局引用中的 ndt 为最大值
-            # 这样 FlashInfer 在分配内部数组 (qo_indptr) 时会按最大规模分配空间
-            orig_global_ndt = getattr(
-                self.model_runner.attn_backend, "num_draft_tokens", 1
-            )
-            self.model_runner.attn_backend.num_draft_tokens = max_ndt_needed
-
+            # [核心修改 2.1]：实例化该分区专属的后端，防止元数据串扰
             part_backend = type(self.model_runner.attn_backend)(self.model_runner)
-
-            # 还原主后端的全局值
-            self.model_runner.attn_backend.num_draft_tokens = orig_global_ndt
-
-            # 设置当前分区后端实际使用的 ndt
-            if hasattr(part_backend, "num_draft_tokens"):
-                part_backend.num_draft_tokens = part_ndt
-
-            # 执行初始化，此时物理空间已按 max_ndt_needed 足额分配
             part_backend.init_cuda_graph_state(
                 partition_max_bs, partition_max_num_token
             )
@@ -1143,7 +1087,9 @@ class CudaGraphRunner:
             self._green_ctx_partition_bs = [partition_max_bs]
 
         logger.info(
-            f"GreenContext: Capturing Independent Heterogeneous Graphs (NDTs: {self.green_ctx_ndts})"
+            f"GreenContext: initialized {num_partitions} partitions, "
+            f"partition_max_bs={partition_max_bs}. "
+            f"Capturing independent graphs for bs={self._green_ctx_partition_bs}..."
         )
 
         orig_buffers = self.buffers
@@ -1156,10 +1102,6 @@ class CudaGraphRunner:
                 for part_idx in range(num_partitions):
                     self.buffers = self.green_ctx_buffers[part_idx]
                     part_backend = self.green_ctx_attn_backends[part_idx]
-                    part_ndt = self.green_ctx_ndts[part_idx]
-
-                    orig_ndt = self.num_tokens_per_bs
-                    self.num_tokens_per_bs = part_ndt
 
                     with self.green_ctx_manager.use_partition(part_idx) as gc_stream:
                         self.stream = gc_stream
@@ -1167,9 +1109,10 @@ class CudaGraphRunner:
                             with patch_model(
                                 self.model_runner.model,
                                 bs in self.compile_bs,
-                                num_tokens=bs * part_ndt,
+                                num_tokens=bs * self.num_tokens_per_bs,
                                 tp_group=self.model_runner.tp_group,
                             ) as forward:
+                                # 传递专属后端进入捕获阶段，彻底锁死内部指针！
                                 graph, out_bufs = self.capture_one_batch_size(
                                     bs,
                                     forward,
@@ -1178,34 +1121,106 @@ class CudaGraphRunner:
                                 )
                                 self.green_ctx_graphs[part_idx][bs] = graph
                                 self.green_ctx_output_buffers[part_idx][bs] = out_bufs
-                    self.num_tokens_per_bs = orig_ndt
         finally:
             self.buffers = orig_buffers
             if orig_stream is not None:
                 self.stream = orig_stream
 
+        logger.info("GreenContext: independently captured graphs for all partitions.")
+
     def _build_seq_lens_cpu(self, forward_batch: ForwardBatch, raw_bs: int, bs: int):
+        """构造 padded seq_lens_cpu，FlashInfer attn backend 需要这个参数。"""
         seq_lens_cpu = torch.empty(bs, dtype=torch.int32, device="cpu")
         seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
         if raw_bs < bs:
             seq_lens_cpu[raw_bs:bs].fill_(self.seq_len_fill_value)
         return seq_lens_cpu
 
-    def replay_concurrent_green_context(self, forward_batches: list) -> list:
-        """非对称异构多分区并发回放。"""
-        num_parts = len(forward_batches)
-        outputs = [None] * num_parts
-        prepared = []
+    def replay_green_context(
+        self,
+        partition_idx: int,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """在指定 SM 分区上 replay 该分区专属的 graph。"""
+        assert self.green_ctx_manager is not None, "先调用 init_green_context()"
 
+        part_buffers = self.green_ctx_buffers[partition_idx]
+        part_backend = self.green_ctx_attn_backends[partition_idx]
+        raw_bs = forward_batch.batch_size
+        raw_num_token = raw_bs * self.num_tokens_per_bs
+
+        index = bisect.bisect_left(self.capture_bs, raw_bs)
+        if index >= len(self.capture_bs):
+            raise RuntimeError(
+                f"Batch size {raw_bs} exceeds max captured bs={self.capture_bs[-1]}"
+            )
+        bs = self.capture_bs[index]
+
+        orig_buffers = self.buffers
+        self.buffers = part_buffers
+
+        part_buffers.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        part_buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        part_buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        part_buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        part_buffers.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+        if raw_bs < bs:
+            part_buffers.seq_lens[raw_bs:bs].fill_(self.seq_len_fill_value)
+
+        seq_lens_cpu = self._build_seq_lens_cpu(forward_batch, raw_bs, bs)
+
+        # [核心修改 3]：使用分区专属后端进行 metadata 初始化
+        part_backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            part_buffers.req_pool_indices[:bs],
+            part_buffers.seq_lens[:bs],
+            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            (part_buffers.encoder_lens[:bs] if self.is_encoder_decoder else None),
+            self.capture_forward_mode,
+            forward_batch.spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+
+        gc_stream = self.green_ctx_manager.get_torch_stream(partition_idx)
+        with torch.cuda.stream(gc_stream):
+            self.green_ctx_graphs[partition_idx][bs].replay()
+
+        self.buffers = orig_buffers
+        gc_stream.synchronize()
+
+        output = self.green_ctx_output_buffers[partition_idx][bs]
+        if isinstance(output, LogitsProcessorOutput):
+            return LogitsProcessorOutput(
+                next_token_logits=output.next_token_logits[:raw_num_token].clone(),
+                full_logits=None,
+                hidden_states=(
+                    output.hidden_states[:raw_num_token].clone()
+                    if output.hidden_states is not None
+                    else None
+                ),
+            )
+        return output
+
+    def replay_concurrent_green_context(
+        self,
+        forward_batches: list,
+    ) -> list:
+        """多分区并发 replay，各分区使用独立图避免数据竞争。"""
+        assert self.green_ctx_manager is not None, "先调用 init_green_context()"
+        num_parts = len(forward_batches)
+        assert num_parts <= self.green_ctx_manager.num_partitions
+
+        outputs = [None] * num_parts
+
+        # Step 1: 填充 buffer + 构造 seq_lens_cpu
+        prepared = []
         for part_idx, fb in enumerate(forward_batches):
             part_buffers = self.green_ctx_buffers[part_idx]
-            part_ndt = self.green_ctx_ndts[part_idx]
             raw_bs = fb.batch_size
-            raw_num_token = raw_bs * part_ndt
+            raw_num_token = raw_bs * self.num_tokens_per_bs
 
-            # 用分区专属的 bs 列表查找，而不是全局的 self.capture_bs
-            index = bisect.bisect_left(self._green_ctx_partition_bs, raw_bs)
-            bs = self._green_ctx_partition_bs[index]
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
+            bs = self.capture_bs[index]
 
             part_buffers.input_ids[:raw_num_token].copy_(fb.input_ids)
             part_buffers.positions[:raw_num_token].copy_(fb.positions)
@@ -1218,6 +1233,7 @@ class CudaGraphRunner:
             seq_lens_cpu = self._build_seq_lens_cpu(fb, raw_bs, bs)
             prepared.append((bs, raw_bs, raw_num_token, seq_lens_cpu))
 
+        # Step 2: init attn + launch on partition streams
         orig_buffers = self.buffers
 
         for part_idx, fb in enumerate(forward_batches):
@@ -1226,6 +1242,8 @@ class CudaGraphRunner:
             part_backend = self.green_ctx_attn_backends[part_idx]
 
             self.buffers = part_buffers
+
+            # [核心修改 4]：使用各自专属后端的元数据去进行重放，彻底切断所有数据污染途径！
             part_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 part_buffers.req_pool_indices[:bs],
@@ -1242,8 +1260,11 @@ class CudaGraphRunner:
                 self.green_ctx_graphs[part_idx][bs].replay()
 
         self.buffers = orig_buffers
+
+        # Step 3: 同步
         self.green_ctx_manager.synchronize_all()
 
+        # Step 4: 收集输出
         for part_idx in range(num_parts):
             bs, raw_bs, raw_num_token, _ = prepared[part_idx]
             output = self.green_ctx_output_buffers[part_idx][bs]
@@ -1263,6 +1284,16 @@ class CudaGraphRunner:
         return outputs
 
 
+CUDA_GRAPH_CAPTURE_FAILED_MSG = (
+    "Possible solutions:\n"
+    "1. set --mem-fraction-static to a smaller value (e.g., 0.8 or 0.7)\n"
+    "2. set --cuda-graph-max-bs to a smaller value (e.g., 16)\n"
+    "3. disable torch compile by not using --enable-torch-compile\n"
+    "4. disable CUDA graph by --disable-cuda-graph. (Not recommended. Huge performance loss)\n"
+    "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
+)
+
+
 class DeepEPCudaGraphRunnerAdapter:
     def __init__(self):
         self._captured_deepep_mode = None
@@ -1278,4 +1309,5 @@ class DeepEPCudaGraphRunnerAdapter:
     def replay(self):
         if not get_moe_a2a_backend().is_deepep():
             return
+        assert self._captured_deepep_mode is not None
         DeepEPBuffer.set_dispatch_mode(self._captured_deepep_mode)

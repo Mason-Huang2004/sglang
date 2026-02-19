@@ -89,6 +89,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
+
 profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     profiler_activity
     for available, profiler_activity in [
@@ -97,6 +98,103 @@ profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     ]
     if available
 ]
+
+
+def benchmark_specific_step_latency(
+    model_runner, batch_size, context_len, spec_len, target_step, rank_print
+):
+    """
+    基于你定义的风格进行修改：
+    target_step=1: 测量 KV Cache 为 context_len 时的验证耗时
+    target_step=1024: 测量 KV Cache 为 context_len + 1023 时的验证耗时
+    """
+
+    def run_pass(is_warmup=False):
+        model_runner.req_to_token_pool.clear()
+        model_runner.token_to_kv_pool_allocator.clear()
+        if not is_warmup:
+            torch.cuda.empty_cache()
+
+        dummy_sampling_params = SamplingParams(max_new_tokens=target_step + spec_len)
+        empty_prefix_tensor = torch.empty(
+            0, dtype=torch.int32, device=model_runner.device
+        )
+
+        # --- 阶段 1: Context Prefill ---
+        context_ids = np.random.randint(
+            0, 10000, (batch_size, context_len), dtype=np.int32
+        )
+        reqs = []
+        for i in range(batch_size):
+            req = Req(
+                rid=i,
+                origin_input_text="",
+                origin_input_ids=list(context_ids[i]),
+                sampling_params=dummy_sampling_params,
+            )
+            req.fill_ids = list(context_ids[i])
+            req.prefix_indices = empty_prefix_tensor
+            req.extend_input_len = context_len
+            reqs.append(req)
+
+        synchronize(model_runner.device)
+        next_token_ids, _, batch = extend(reqs, model_runner)
+        # prefill 之后 KV cache 有 context_len 个 token
+        # next_token_ids 是第 1 次 decode 的输入
+
+        # --- 阶段 2: 做 target_step - 1 次 decode ---
+        # 第 1 次 decode 用 next_token_ids，产出后就完成了 1st decode
+        # 所以循环 target_step - 1 次 = 做完第 (target_step-1) 次 decode
+        # 之后 KV cache 有 context_len + (target_step - 1) 个 token
+        if target_step > 1:
+            current_token_ids = next_token_ids
+            for step in range(target_step - 1):
+                current_token_ids, _ = decode(current_token_ids, batch, model_runner)
+
+        # 同步 fill_ids 以匹配 KV cache 实际长度
+        # decode 每做一步，batch 内部自动给 KV cache 增加 1 个位置
+        # 但 fill_ids 没有自动更新，需要手动补齐
+        # KV cache 实际长度 = context_len + (target_step - 1)
+        # fill_ids 当前长度 = context_len
+        # 需要补 target_step - 1 个 dummy token
+        for i in range(batch_size):
+            reqs[i].fill_ids.extend([0] * (target_step - 1))
+
+        # --- 阶段 3: 测量第 target_step 次 decode (并行验证) ---
+        spec_ids = np.random.randint(0, 10000, (batch_size, spec_len), dtype=np.int32)
+        current_kv_len = context_len + (target_step - 1)
+
+        for i in range(batch_size):
+            req = reqs[i]
+            req.fill_ids.extend(list(spec_ids[i]))
+            req.prefix_indices = model_runner.req_to_token_pool.req_to_token[i][
+                :current_kv_len
+            ]
+            req.extend_input_len = spec_len
+
+        synchronize(model_runner.device)
+        start_time = time.perf_counter()
+        _, _, _ = extend(reqs, model_runner)
+        synchronize(model_runner.device)
+        end_time = time.perf_counter()
+        return (end_time - start_time) * 1000
+
+    # 逻辑：Warmup -> 正式测量 (你的平均值逻辑)
+    try:
+        run_pass(is_warmup=True)
+    except Exception as e:
+        import traceback
+
+        rank_print(f"Warmup failed: {e}")
+        traceback.print_exc()
+        return 0.0
+
+    num_iters = 3
+    total_latency = 0.0
+    for _ in range(num_iters):
+        total_latency += run_pass(is_warmup=False)
+
+    return total_latency / num_iters
 
 
 def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
